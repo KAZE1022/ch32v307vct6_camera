@@ -19,7 +19,6 @@
 #include "stdlib.h"
 
 #define  delay_ms(x)  Delay_Ms(x)
-#define  delay_us(x)  Delay_Us(x)
 
 /*==============================================================================
  *  一、画面显示开关(整屏级)
@@ -45,10 +44,6 @@
 #endif
 
 /* 4) 补色(整屏反相, 像底片): 0 = 正常, 1 = 反相 */
-#ifdef LCD_USE_INVON                        /* 兼容旧名字 */
-#undef  LCD_INVERT
-#define LCD_INVERT       LCD_USE_INVON
-#endif
 #ifndef LCD_INVERT
 #define LCD_INVERT       0
 #endif
@@ -138,7 +133,7 @@
 #define LCD_BLK_OFF()     GPIO_ResetBits(LCD_BLK_PORT,LCD_BLK_PIN)
 
 /*==============================================================================
- *  四、颜色定义(RGB565)
+ *  四、颜色定义(RGB565) —— 只留工程里用到的几个
  *============================================================================*/
 #define WHITE            0xFFFF
 #define BLACK            0x0000
@@ -149,15 +144,6 @@
 #define MAGENTA          0xF81F
 #define YELLOW           0xFFE0
 #define GRAY             0x8430
-#define BROWN            0xBC40
-#define BRRED            0xFC07
-#define DARKBLUE         0x01CF
-#define LIGHTBLUE        0x7D7C
-#define GRAYBLUE         0x5458
-#define LIGHTGREEN       0x841F
-#define LGRAY            0xC618
-#define LGRAYBLUE        0xA651
-#define LBBLUE           0x2B12
 
 /*==============================================================================
  *  五、对外接口
@@ -166,16 +152,21 @@ void LCD_Init(void);
 void LCD_BackLight(u8 on);
 void LCD_WriteCmd(u8 cmd);
 void LCD_WriteCmdParam(u8 cmd, const u8 *param, u16 len);
-void LCD_WriteData16(u16 data);
 void LCD_SetWindow(u16 xs, u16 ys, u16 xe, u16 ye);
-void LCD_SetCursor(u16 x, u16 y);
 void LCD_Clear(u16 color);
 void LCD_Fill(u16 xs, u16 ys, u16 xe, u16 ye, u16 color);
 void LCD_ShowChar(u16 x, u16 y, char ch, u16 fc, u16 bc);
 void LCD_ShowString(u16 x, u16 y, const char *str, u16 fc, u16 bc);
 
-/* 把每个像素的两个字节交换(OV2640 低字节先发 -> ST7735S 要高字节先发) */
-void LCD_SwapPixelBytes(const u8 *src, u8 *dst, u16 pixels);
+/* 把一个 6x12 字符画进"一段内存缓冲"(不是屏), 供实时画面叠字用:
+ *   buf      - 缓冲起点
+ *   stride   - 每行字节数(如 ROW_BYTES)
+ *   max_rows - 这段缓冲有几行(超出部分自动丢掉, 不会写到隔壁去)
+ *   x        - 列(像素, 0 = 最左)
+ *   y        - 行(像素, 可以是负数: 字符顶部被裁掉一部分, 用来跨"片"画字)
+ * 缓冲里的像素顺序是"高字节在前"(和推屏顺序一致). */
+void LCD_BufShowChar(u8 *buf, u16 stride, u16 max_rows, s16 y, u16 x,
+                     char ch, u16 fc, u16 bc);
 
 /* 刷一个"横条": 把 buf 里的 rows 行像素写到屏幕第 y 行开始的位置.
  * 用 SPI+DMA 发送, 不等发完就返回(内部会先等上一次发完).
@@ -185,7 +176,7 @@ void LCD_PushBlock(u16 y, const u8 *buf, u16 rows);
 /* 那段横条还在搬吗? ==1 时 DMA 正在读 buf, 这块内存不能被改写(会花屏) */
 u8   LCD_PushBusy(void);
 
-/* 上一帧是否已发完; ==1 时才能再调用 LCD_PushFrame / 画其他东西 */
+/* 上一段横条是否已发完(收尾: 等最后一个字节移出、拉高 CS) */
 u8   LCD_FrameDone(void);
 void LCD_WaitFrameDone(void);
 

@@ -123,17 +123,6 @@ void LCD_WriteCmdParam(u8 cmd, const u8 *param, u16 len)
     LCD_CS_H();
 }
 
-void LCD_WriteData16(u16 data)
-{
-    LCD_WaitFrameDone();
-    LCD_CS_L();
-    LCD_DC_H();
-    LCD_SPI_SendByte(data >> 8);
-    LCD_SPI_SendByte(data & 0xFF);
-    LCD_SPI_WaitDone();
-    LCD_CS_H();
-}
-
 /*==============================================================================
  *  SPI 发送 DMA(把 CPU 从"搬像素"里解放出来, 这是帧率的关键)
  *  SPI2_TX 对应 DMA1_Channel5
@@ -321,11 +310,6 @@ void LCD_SetWindow(u16 xs, u16 ys, u16 xe, u16 ye)
     LCD_WriteCmdParam(0x2B, p, 4);                      /* RASET 行地址 */
 }
 
-void LCD_SetCursor(u16 x, u16 y)
-{
-    LCD_SetWindow(x, y, x, y);
-}
-
 void LCD_Fill(u16 xs, u16 ys, u16 xe, u16 ye, u16 color)
 {
     u32 i, n;
@@ -407,6 +391,79 @@ void LCD_ShowChar(u16 x, u16 y, char ch, u16 fc, u16 bc)
     LCD_CS_H();
 }
 
+/*********************************************************************
+ * @fn      LCD_BufShowChar
+ *
+ * @brief   把一个 6x12 字符画进一段内存缓冲(不是屏).
+ *          实时画面是"分片"连续刷屏的, 直接画在屏上的字会被下一片盖掉,
+ *          所以叠字必须画进片缓冲里, 跟着画面一起推出去.
+ *          行号允许为负(字符上半截留在上一片里), 超出的行会被丢掉,
+ *          绝对不会写到缓冲外面去.
+ *
+ * @param   buf      - 缓冲起点
+ *          stride   - 每行字节数
+ *          max_rows - 缓冲总行数
+ *          y        - 起始行(可负)
+ *          x        - 起始列
+ *          ch       - 字符
+ *          fc/bc    - 前景/背景色
+ *
+ * @return  none
+ */
+void LCD_BufShowChar(u8 *buf, u16 stride, u16 max_rows, s16 y, u16 x,
+                     char ch, u16 fc, u16 bc)
+{
+    const unsigned char *p;
+    s16  row;
+    u16  c, col;
+    u8   b0, b1;
+
+    if((ch < ' ') || (ch > '~'))
+    {
+        ch = ' ';
+    }
+    p = asc2_1206[(u8)(ch - ' ')];
+
+    for(c = 0; c < 6; c++)
+    {
+        col = (u16)(x + c);
+        if((u32)(col + 1) * 2 > stride)             /* 超出这一行宽度 */
+        {
+            break;
+        }
+        b0 = p[2 * c];
+        b1 = p[2 * c + 1];
+
+        for(row = 0; row < 12; row++)
+        {
+            u16 pix;
+            u8 *q;
+
+            if(((s16)(y + row)) < 0)
+            {
+                continue;                           /* 在缓冲上面, 丢掉 */
+            }
+            if((u16)(y + row) >= max_rows)
+            {
+                break;                              /* 在缓冲下面, 丢掉 */
+            }
+
+            if(row < 8)
+            {
+                pix = (b0 & (0x80 >> row)) ? fc : bc;
+            }
+            else
+            {
+                pix = (b1 & (0x80 >> (row - 8))) ? fc : bc;
+            }
+
+            q = buf + (u32)(y + row) * stride + 2 * col;
+            q[0] = (u8)(pix >> 8);                  /* 高字节在前(推屏顺序) */
+            q[1] = (u8)(pix & 0xFF);
+        }
+    }
+}
+
 void LCD_ShowString(u16 x, u16 y, const char *str, u16 fc, u16 bc)
 {
     while(*str)
@@ -422,20 +479,6 @@ void LCD_ShowString(u16 x, u16 y, const char *str, u16 fc, u16 bc)
         }
         LCD_ShowChar(x, y, *str++, fc, bc);
         x += 6;
-    }
-}
-
-/*==============================================================================
- *  视频流
- *============================================================================*/
-void LCD_SwapPixelBytes(const u8 *src, u8 *dst, u16 pixels)
-{
-    u16 i;
-
-    for(i = 0; i < pixels; i++)
-    {
-        dst[2 * i]     = src[2 * i + 1];
-        dst[2 * i + 1] = src[2 * i];
     }
 }
 

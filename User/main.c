@@ -57,6 +57,22 @@
 /* 诊断页行数(每行的位置按屏高自动均分, 竖屏/横屏都能排下) */
 #define DIAG_LINES           10
 
+/* 实时画面左下角的帧率叠字: 1 = 显示, 0 = 不显示
+ * 做法是把文字直接画进"片"缓冲, 跟着画面一起推给屏 —— 所以它不会被下一次
+ * 刷新冲掉(用 LCD_ShowString 直接画在屏上是不行的, 几十毫秒后就被画面盖掉). */
+#ifndef SHOW_FPS
+#define SHOW_FPS             1
+#endif
+
+/* 帧率统计窗口(ms): 每积累这么多时间结算一次 */
+#define FPS_WIN_MS           1000
+
+/* 软件白平衡(灰世界): 1 = 自动把 R/G/B 拉平(画面发黄/发蓝时很有用), 0 = 不处理
+ * 画面本来就正常时它不会乱动(系数停在 1.0); 只在明显偏色时才修, 且限制在 0.5~2 倍 */
+#ifndef CAM_AWB
+#define CAM_AWB              1
+#endif
+
 /* 摄像头像素字节序: OV2640 的 RGB565 是"低字节先发"(WCH 表里 0xDA=0x09 =
  * RGB565 | LBYTE_FIRST), 而 ST7735S 要求高字节先发, 所以必须交换一次.
  * 正常保持 1; 万一颜色变成另一种错法再试 0 */
@@ -67,13 +83,10 @@
 /* 画面左右镜像: 1 = 摄像头画面水平翻转(左右对调)显示, 0 = 正常
  * 只影响摄像头画面; 屏幕上的诊断文字/校准画面**不受影响**(保持可读).
  * 做法是在把每一行存进帧缓冲时顺便反过来, 不额外花时间、不影响帧率.
- * 注: 如果想让整屏(含文字)一起镜像, 改成改 lcd.h 里的 LCD_MADCTL = 0x40 */
+ * 注: 如果想让整屏(含文字)一起镜像, 用 lcd.h 里的 LCD_MIRROR_H = 1 */
 #ifndef CAM_MIRROR_X
 #define CAM_MIRROR_X        0
 #endif
-
-/* ISP 整数降采样档位现在由 OV2640_Config() 按"降采样后尺寸 >= 输出尺寸"
- * 自动挑选, 不需要手工设置 */
 
 /*==============================================================================
  *  帧率开关(画面"延迟感"的真正大头)
@@ -100,113 +113,157 @@
 #define OV2640_CLK_X         (2 * (((OV2640_CLKRC) & 0x80) ? 2 : 1) / (((OV2640_CLKRC) & 0x3F) + 1))
 
 /* 摄像头输出时钟分频: PCLK = CLK / 本值
- *   默认跟着上面自动走, 让 PCLK 恒等于 12MHz(现在验证过没问题的值):
+ *   默认让 PCLK 保持 12MHz(现在验证过没问题的值):
  *     CLKRC=0x01 -> 1     CLKRC=0x00 -> 2     CLKRC=0x80 -> 4
+ *   例外: SVGA 栅格 + 48MHz 时, 一行只有约 25us, 而 240 像素 x2 字节在
+ *         12MHz 下要 40us —— 塞不进一行, 所以这时自动改成 24MHz(PCLK_DIV=2).
  *   想让 DVP 采样更宽松(更慢但更稳)可以手动调大; 调太小会花屏/错位 */
 #ifndef OV2640_PCLK_DIV
-#define OV2640_PCLK_DIV      OV2640_CLK_X
+#if (OV2640_SVGA_MODE == 1) && (OV2640_CLK_X >= 4)
+#define OV2640_PCLK_DIV      (OV2640_CLK_X / 2)      /* 24MHz */
+#else
+#define OV2640_PCLK_DIV      OV2640_CLK_X            /* 12MHz */
+#endif
 #endif
 
-/* 低延迟模式(固定短曝光 + 自动增益):
- *   画面延迟 ≈ 一帧时间 ≈ 曝光时间. 暗处自动曝光会把帧时间拉到几百毫秒,
- *   这就是"晃动时明显延迟"的主因. 打开本项后延迟可以压到几十毫秒,
- *   代价是暗处噪点变多(亮度由自动增益补).
- *   0 = 保持原厂自动曝光(暗处延迟大)      1 = 低延迟(默认) */
+/*==============================================================================
+ *  亮度: 软件自动曝光(默认开)
+ *  摄像头自己的自动曝光在这里不好使(暗处会把帧时间拉到几百毫秒, 而且和
+ *  "固定曝光保延迟"的做法冲突), 所以改成**我们自己测亮度、自己调**:
+ *     每 200ms 测一次画面亮度(行缓冲高字节的平均值, 0~255),
+ *       太暗: 先把曝光加到满(255), 还暗再加增益
+ *       太亮: 先减增益, 减到最小还亮再减曝光
+ *  这样任何光线下都能自己收敛, 诊断页能看到它当前用的曝光/增益和测到的亮度.
+ *  想改回"固定曝光+固定增益"(不自动调): OV2640_AUTO_EXP 改成 0
+ *============================================================================*/
+#ifndef OV2640_AUTO_EXP
+#define OV2640_AUTO_EXP      1
+#endif
+
+/* 目标亮度(0~255): 越大画面越亮. 100~130 比较自然; 嫌暗就加到 150 */
+#ifndef OV2640_AE_TARGET
+#define OV2640_AE_TARGET     110
+#endif
+
+/* 自动曝光的"死区"和步长 —— 防抖用:
+ *   亮度落在 目标±AE_BAND 以内就**一点都不动**(不然会一会儿亮一会儿暗, 就是"呼吸")
+ *   要动的时候每步也只走 AE_STEP_xxx, 慢慢靠过去, 不会一下跳一大截 */
+#define AE_BAND              14      /* 死区(0~255): 调大更稳, 调小反应更快 */
+#define AE_STEP_EXP          12      /* 曝光每步最大变化 */
+#define AE_STEP_GAIN         8       /* 增益每步最大变化 */
+#define AE_AVG_SHIFT         2       /* 亮度/颜色的低通滤波强度(2 = 平均最近约 4 次) */
+
+/* 低延迟模式: 固定曝光(关掉摄像头自带的自动曝光)
+ *   0 = 用原厂自动曝光(暗处延迟几百毫秒)    1 = 低延迟(默认) */
 #ifndef OV2640_LOW_LATENCY
 #define OV2640_LOW_LATENCY   1
 #endif
 
-/* 固定曝光值: 越小延迟越低、画面越暗. 建议范围 1~32
- *   太暗 -> 加大(16/24/32)   延迟还是大 -> 减小(4/2)
- *   注: 真正写进摄像头的值是这个数再乘时钟倍率(见上面 OV2640_CLK_X),
- *       因为帧率一快, 单位"行"的时间就短了, 必须按倍数补回来 */
-#ifndef OV2640_AEC_VALUE
-#define OV2640_AEC_VALUE     16
+/* 固定曝光时间(名义值), 单位微秒(µs) —— 只有 OV2640_AUTO_EXP=0 时才是"固定"的,
+ * 开着自动曝光时它就是**起始值**(回路会自己往上/往下调).
+ *   加曝光不提噪点, 但画面更容易糊(运动模糊), 太大还会拖慢帧率.
+ *   注 1: "一行"的时间随"栅格模式 + 帧率时钟"变, 这里已经自动换算好了
+ *   注 2: 真正写进摄像头 AEC(0x10) 的值 = 换算结果, 诊断页会显示出来.
+ *         手册对 0x10 的刻度说法不一(Linux 驱动注释是 AEC[9:2], 即 1 个数 = 4 行),
+ *         所以**绝对毫秒数不必较真, 以画面亮度为准**; 8 位寄存器写满 255 就到顶. */
+#ifndef OV2640_AEC_US
+#define OV2640_AEC_US        8000
 #endif
 
-/* 实际写入摄像头的曝光值(自动乘倍数并限制在 8 位内) */
-#define OV2640_AEC_OUT       ((((u32)OV2640_AEC_VALUE * OV2640_CLK_X) > 255) ? 255 : \
-                              ((u32)OV2640_AEC_VALUE * OV2640_CLK_X))
-
-/* 手动增益(和曝光配合决定亮度): 0x01~0xFF, 越大越亮也越噪
- *   画面太暗 -> 加大(0x80 / 0xC0 / 0xFF)
- *   画面发白/过曝 -> 减小(0x20 / 0x10)
- *   填 0 = 增益保持自动(只固定曝光) */
-#ifndef OV2640_GAIN_VALUE
-#define OV2640_GAIN_VALUE    0xCF
+/* 栅格模式(SVGA 开关) —— 帧率的"总开关"(帧率 = CLK / (tLINE x 每帧行数)):
+ *   0 = UXGA 栅格: tLINE=1922, 约 1560 行/帧 -> 48MHz 时约 16fps  (画面最细)
+ *   1 = SVGA 栅格: tLINE=1190, 约  672 行/帧 -> 帧率约 4 倍
+ *       配 OV2640_CLKRC=0x00(24MHz) 约 30fps, 配 0x80(48MHz) 约 60fps
+ *   ⚠ 帧率越高, 一帧时间越短 -> 曝光上限越小 -> 暗处越暗(30fps 时一帧只有 33ms).
+ *     画面花了/比例不对就先改回 0. */
+#ifndef OV2640_SVGA_MODE
+#define OV2640_SVGA_MODE     0
 #endif
 
-/* 读出窗口实验开关(帧率的潜在总开关, 但目前还没调通):
- *   0 = 【默认, 已知可用】用 WCH 原配置: 输出 240x320 + 屏上取中心 128x160
- *       row/f 应该是 320, 画面正常, 帧率约 4fps
- *   1 = 【实验】读出窗口 + DSP 输入尺寸 + 输出 128x160 全套
- *       实测 row/f 变成 14529 -> 说明设置没生效(摄像头还在输出整幅), 画面会花
- *   2 = 【实验, 最可能有用】只改传感器读出窗口, DSP 和输出尺寸都保持 WCH 原样
- *       (WCH 自己就是"窗口 800x600 + DSP 认为 1600x1200"的错配配置且能正常出图,
- *        所以只改窗口最可能生效: 读的行数少了, 帧率就该上去)
- * 先试 2, 记下 fps / row/f / 画面是否正常; 不行再试 1; 都能回到 0。 */
-#ifndef OV2640_READOUT_OPT
-#define OV2640_READOUT_OPT   0
-#endif
-
-#if (OV2640_READOUT_OPT == 0)
-#define CAM_OUT_W            240      /* 老配置: 输出 240x320 ... */
-#define CAM_OUT_H            320
+/* 一行的时间(以时钟周期数表示): tLINE = 本值 / CLK, CLK = 12MHz x OV2640_CLK_X */
+#if (OV2640_SVGA_MODE == 1)
+#define OV2640_TLINE_TX      1190
 #else
-#define CAM_OUT_W            LCD_WIDTH   /* 新配置: 输出 = 屏尺寸 */
-#define CAM_OUT_H            LCD_HEIGHT
+#define OV2640_TLINE_TX      1922
 #endif
 
-/* 传感器内部读出窗口(仅 OPT=1/2 时使用), 宽必须是 16 的倍数, 高必须是 8 的倍数 */
-#ifndef OV2640_READOUT_W
-#define OV2640_READOUT_W     424
+/* 换算成摄像头要的曝光值: 时间(µs) / 一行的时间(µs), 再限制在 8 位寄存器上限 */
+#define OV2640_AEC_LINES     ((OV2640_AEC_US * 12 * OV2640_CLK_X) / OV2640_TLINE_TX)
+#if (OV2640_AEC_LINES > 255)
+#undef  OV2640_AEC_LINES
+#define OV2640_AEC_LINES     255
 #endif
-#ifndef OV2640_READOUT_H
-#define OV2640_READOUT_H     300
+
+/* 增益: 和曝光一起决定亮度
+ *   OV2640_AUTO_EXP=1 时这是**起始值**(回路会自己调)
+ *   OV2640_AUTO_EXP=0 时这是固定值: 0 = 增益自动(上限 128x), 0x01~0xFF = 手动固定
+ *     太暗 -> 加大(0x80 / 0xCF / 0xFF)  过曝 -> 减小(0x20 / 0x10) */
+#ifndef OV2640_GAIN_VALUE
+#define OV2640_GAIN_VALUE    0x40
 #endif
 
 /*==============================================================================
  *  摄像头参数和屏幕的匹配(视野开关)
- *  摄像头输出 240x320(3:4), 屏是 128x160(4:5), 两者不是同一个比例, 两种做法:
+ *  摄像头输出固定 240x320(3:4), 屏是 128x160(4:5), 两者不是同一个比例, 两种做法:
  *
- *   0 = 【默认, 最清楚】中心 1:1 裁剪: 取画面正中间的 128x160 原样上屏.
+ *   0 = 【默认, 最清楚】上面的固定取景框: 中心 128x160 原样上屏(1:1).
  *       一个摄像头像素 = 一个屏像素, 不缩放、不模糊、不花 CPU、不影响帧率.
  *       代价: 只看得到摄像头视野中心约 1/4 的面积(四周被裁掉了).
- *       (裁哪一块看 CROP_X / CROP_Y, 默认居中)
  *
- *   1 = 全视野 2:1 降采样: 把整幅 240x320 缩到屏上(横向 240->128, 纵向 320->160).
+ *   1 = 全视野降采样: 忽略取景框, 把整幅 240x320 缩到屏上(横竖都按比例取).
  *       看到的是摄像头的**全部视野**, 一点不裁.
- *       代价: 画面变"糊/有锯齿"(最近邻取样, 没做平均), 而且横向是 1.875:1
- *       的非整数缩放, 竖线会略有不均匀. 帧率不受影响.
+ *       代价: 画面变"糊/有锯齿"(最近邻取样, 没做平均). 帧率不受影响.
  *============================================================================*/
 #ifndef CAM_FULL_VIEW
 #define CAM_FULL_VIEW        0
 #endif
 
 /*==============================================================================
+ *  取景框: 固定取摄像头输出画面(240x320)的**正中间** 128x160
+ *
+ *  以画面中心点算:
+ *      横向 128  ->  左右各占一半: 左右各丢 56 列, 取第  56..183 列
+ *      纵向 160  ->  上下各占一半: 上下各丢 80 行, 取第  80..239 行
+ *  1 个摄像头像素 = 1 个屏像素(1:1), 不缩放、不花 CPU、不影响帧率.
+ *  这两个数只跟"摄像头输出尺寸"有关, 和屏幕旋转/镜像/补色**无关**.
+ *
+ *  注: 只有屏也是 128x160(竖屏)时才能 1:1 铺满 —— 旋转 90/270 会变成 160x128,
+ *      那时要把 CAM_VIEW_W/H 改成 160/128(否则屏两侧会空黑边), 代码里已做检查.
+ *============================================================================*/
+#ifndef CAM_VIEW_W
+#define CAM_VIEW_W           128
+#endif
+#ifndef CAM_VIEW_H
+#define CAM_VIEW_H           160
+#endif
+
+/*==============================================================================
  *  摄像头取图与裁剪
  *============================================================================*/
-#define CAM_WIDTH             CAM_OUT_W                    /* 240 */
-#define CAM_HEIGHT            CAM_OUT_H                    /* 320 */
+#define CAM_WIDTH             240                          /* 摄像头输出宽 */
+#define CAM_HEIGHT            320                          /* 摄像头输出高 */
 #define CAM_ROW_BYTES         (CAM_WIDTH * 2)              /* 480 */
 
-/* 屏上显示摄像头画面的"中间 128x160"(只有输出大于屏尺寸时才需要裁剪) */
+/* 取景框必须比输出小, 而且差值必须是偶数, 才谈得上"上下/左右各占一半" */
+#if ((CAM_WIDTH - CAM_VIEW_W) < 0) || ((CAM_HEIGHT - CAM_VIEW_H) < 0)
+#error "取景框比摄像头输出画面还大: 请把 CAM_VIEW_W / CAM_VIEW_H 改小"
+#endif
+#if (((CAM_WIDTH - CAM_VIEW_W) % 2) != 0) || (((CAM_HEIGHT - CAM_VIEW_H) % 2) != 0)
+#error "取景框和摄像头输出的差不是偶数, 做不到上下/左右各占一半"
+#endif
+
+/* 居中: 左边和右边各留 (240-128)/2 = 56 列, 上边和下边各留 (320-160)/2 = 80 行 */
+#define CROP_X                ((CAM_WIDTH  - CAM_VIEW_W) / 2)      /* 56 */
+#define CROP_Y                ((CAM_HEIGHT - CAM_VIEW_H) / 2)      /* 80 */
+
+#if (CAM_FULL_VIEW == 0) && ((CAM_VIEW_W != LCD_WIDTH) || (CAM_VIEW_H != LCD_HEIGHT))
+#error "取景框是固定的 128x160, 但当前屏尺寸不是 128x160(是不是把 LCD_ROTATE 设成 90/270 了?): 请把 CAM_VIEW_W/H 改成屏尺寸(横屏就是 160/128), 或者把 LCD_ROTATE 改回 0/180"
+#endif
+
 #if (CAM_FULL_VIEW == 1)
-#define CROP_X                0
-#define CROP_Y                0
-#define CAM_ROW_SRC_W         CAM_WIDTH                   /* 这一屏行横跨整行 240 个源像素 */
+#define CAM_ROW_SRC_W         CAM_WIDTH                   /* 全视野模式: 整行 240 个源像素 */
 #else
-/* 显示窗口在摄像头输出画面里的位置(默认居中).
- * 想自己指定就打开下面两行(单位: 摄像头输出像素, 0 = 最左/最上):
- *   #define CROP_X   0
- *   #define CROP_Y   0                                                       */
-#ifndef CROP_X
-#define CROP_X                ((CAM_WIDTH  > LCD_WIDTH ) ? ((CAM_WIDTH  - LCD_WIDTH ) / 2) : 0)
-#endif
-#ifndef CROP_Y
-#define CROP_Y                ((CAM_HEIGHT > LCD_HEIGHT) ? ((CAM_HEIGHT - LCD_HEIGHT) / 2) : 0)
-#endif
-#define CAM_ROW_SRC_W         LCD_WIDTH                   /* 这一屏行横跨 128 个源像素(1:1) */
+#define CAM_ROW_SRC_W         CAM_VIEW_W                  /* 取景框行 128 个源像素(1:1) */
 #endif
 
 #define ROW_BYTES             (LCD_WIDTH * 2)              /* 每行推给屏 256 字节 */
@@ -232,7 +289,6 @@ static volatile u8  slice_ready[SLICE_NUM];       /* 这一片攒满了, 等主�
 static volatile u8  slice_busy[SLICE_NUM];        /* 这一片正在被 DMA 搬给屏, 不能改写 */
 static volatile u16 slice_rows[SLICE_NUM];        /* 这一片已收行数 */
 static volatile u8  slice_inflight = 0xFF;        /* 正在搬的那一片(0xFF=没有) */
-static volatile u16 frame_rows = 0;               /* 本帧已收行数(诊断用) */
 
 /* DVP 行缓冲(乒乓), 每块装摄像头一整行 */
 static u8 dvp_row_buf0[CAM_ROW_BYTES] __attribute__((aligned(4)));
@@ -250,8 +306,271 @@ volatile u32 focus_sum    = 0;      /* 清晰度累计 */
 volatile u32 focus_rows   = 0;      /* 清晰度统计的行数 */
 
 volatile u8  video_on     = 0;      /* 0=显示诊断页, 1=摄像头画面 */
+volatile u8  ae_luma      = 0;      /* 最近一次测到的画面亮度(0~255, 诊断页显示) */
+volatile u8  ae_r = 0, ae_g = 0, ae_b = 0;   /* 最近一次测到的 R/G/B 平均值 */
+
+#if (OV2640_AUTO_EXP == 1)
+static u8 ae_exp  = (u8)OV2640_AEC_LINES;                    /* 当前曝光(写 AEC 0x10) */
+static u8 ae_gain = (u8)((OV2640_GAIN_VALUE != 0) ? OV2640_GAIN_VALUE : 0x40);
+static u8 ae_luma_f = 0;                                     /* 滤波后的亮度 */
+static u8 ae_rf = 0, ae_gf = 0, ae_bf = 0;                   /* 滤波后的 R/G/B */
+static u8 ae_inited = 0;                                     /* 第一次测量直接当初值 */
+#endif
+
+#if (CAM_AWB == 1)
+#define WB_MIN     128      /* 白平衡系数下限 0.50 倍 */
+#define WB_MAX     512      /* 上限 2.00 倍 */
+#define WB_STEP    4        /* 每步最多变这么多(256 = 1.0 倍) */
+#define WB_DEAD    6        /* 死区: 差这么点就不动, 免得颜色一直微调 */
+
+static u16 wb_r = 256, wb_b = 256;                   /* 白平衡系数(8.8 定点, 256 = 1.0) */
+static u8  wb_rlut[32], wb_blut[32];                 /* 系数查表(每像素只查表, 不做乘法) */
+#endif
+
+#if (SHOW_FPS == 1)
+static u32 fps_row_per_ms = 0;      /* 启动时标定: 每毫秒收多少行(摄像头晶振决定, 很准) */
+static u32 fps_val        = 0;      /* 最近一次算出来的帧率 */
+static u32 fps_rps        = 0;      /* 最近一次算出来的行速率 */
+#endif
 
 void DVP_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+
+/*********************************************************************
+ * @fn      CAM_MeasureStats
+ *
+ * @brief   量一下当前画面的 R/G/B 平均值和亮度(都是 0~255), 
+ *          给软件自动曝光(看亮度)和软件白平衡(看 R/G/B 平不平衡)用.
+ *          做法: 从行缓冲里隔 8 字节抽一个像素, 把 RGB565 拆成 R/G/B 累加.
+ *          注: 读的同时 DVP 可能正在写这块缓冲 —— 对"平均值"没影响.
+ *
+ * @param   r/g/b - 输出: 三通道平均值(0~255)
+ *          y     - 输出: 亮度(0.3R + 0.6G + 0.1B)
+ *
+ * @return  none
+ */
+static void CAM_MeasureStats(u8 *r, u8 *g, u8 *b, u8 *y)
+{
+    u32 sr = 0, sg = 0, sb = 0, n = 0;
+    u16 i;
+
+    for(i = 1; i < (u16)CAM_ROW_BYTES; i += 8)
+    {
+        u16 px = (u16)(((u16)dvp_row_buf0[i] << 8) | dvp_row_buf0[i - 1]);   /* 低字节先发 */
+
+        sr += (u16)(((px >> 11) & 0x1F) << 3);      /* R: 5 位 -> 0~248 */
+        sg += (u16)(((px >> 5) & 0x3F) << 2);       /* G: 6 位 -> 0~252 */
+        sb += (u16)((px & 0x1F) << 3);              /* B: 5 位 -> 0~248 */
+        n++;
+    }
+
+    if(n == 0)
+    {
+        *r = 0; *g = 0; *b = 0; *y = 0;
+        return;
+    }
+
+    sr /= n;  sg /= n;  sb /= n;
+    *r = (u8)sr;  *g = (u8)sg;  *b = (u8)sb;
+    *y = (u8)((sr * 77 + sg * 150 + sb * 29) >> 8);
+}
+
+#if (CAM_AWB == 1)
+/*********************************************************************
+ * @fn      CAM_WbBuildLut
+ *
+ * @brief   把白平衡系数做成查表(32 个档位), 这样每个像素只要查两次表,
+ *          比"每像素做乘法"快得多(中断里省时间).
+ *
+ * @return  none
+ */
+static void CAM_WbBuildLut(void)
+{
+    u8 i;
+
+    for(i = 0; i < 32; i++)
+    {
+        u16 v = (u16)(((u16)i * wb_r) >> 8);
+
+        wb_rlut[i] = (u8)((v > 31) ? 31 : v);
+
+        v = (u16)(((u16)i * wb_b) >> 8);
+        wb_blut[i] = (u8)((v > 31) ? 31 : v);
+    }
+}
+#endif  /* CAM_AWB */
+
+#if (CAM_AWB == 1) && (OV2640_AUTO_EXP == 1)
+/*********************************************************************
+ * @fn      CAM_AutoWhiteBalance
+ *
+ * @brief   软件白平衡(灰世界): 让 R/G/B 的平均值趋于相等.
+ *          只动 R 和 B 的系数(0.5~2 倍), 每一步只挪一点, 所以不会来回抖.
+ *          画面本来就正的时候 R/G/B 本来就差不多 -> 系数会停在 1.0 不动.
+ *
+ * @param   r/g/b - 刚量到的三通道平均值
+ *
+ * @return  none
+ */
+static void CAM_AutoWhiteBalance(u8 r, u8 g, u8 b)
+{
+    u32 target;
+    u16 want_r, want_b, diff_r, diff_b;
+
+    if((r < 8) || (b < 8))
+    {
+        return;                                     /* 太暗了, 先让自动曝光去提亮 */
+    }
+
+    target = ((u32)r + g + b) / 3;
+    want_r = (u16)((target << 8) / r);              /* 想要的系数(256 = 1.0 倍) */
+    want_b = (u16)((target << 8) / b);
+
+    if(want_r > WB_MAX) want_r = WB_MAX;
+    if(want_r < WB_MIN) want_r = WB_MIN;
+    if(want_b > WB_MAX) want_b = WB_MAX;
+    if(want_b < WB_MIN) want_b = WB_MIN;
+
+    /* 死区: 差得不多就不动它(免得一直微调, 画面颜色看着在"呼吸") */
+    diff_r = (want_r > wb_r) ? (u16)(want_r - wb_r) : (u16)(wb_r - want_r);
+    diff_b = (want_b > wb_b) ? (u16)(want_b - wb_b) : (u16)(wb_b - want_b);
+    if((diff_r <= WB_DEAD) && (diff_b <= WB_DEAD))
+    {
+        return;
+    }
+
+    /* 每步最多挪 WB_STEP, 慢慢收敛, 避免画面抖色 */
+    if(want_r > (u16)(wb_r + WB_STEP))       wb_r = (u16)(wb_r + WB_STEP);
+    else if((u16)(want_r + WB_STEP) < wb_r)  wb_r = (u16)(wb_r - WB_STEP);
+    else                                     wb_r = want_r;
+
+    if(want_b > (u16)(wb_b + WB_STEP))       wb_b = (u16)(wb_b + WB_STEP);
+    else if((u16)(want_b + WB_STEP) < wb_b)  wb_b = (u16)(wb_b - WB_STEP);
+    else                                     wb_b = want_b;
+
+    CAM_WbBuildLut();
+}
+#endif  /* CAM_AWB && OV2640_AUTO_EXP */
+
+#if (OV2640_AUTO_EXP == 1)
+/*********************************************************************
+ * @fn      CAM_AutoExposure
+ *
+ * @brief   软件自动曝光: 用测到的亮度反过来调"曝光值"和"增益"
+ *            太暗 -> 先加曝光, 曝光到顶(255)了再加增益
+ *            太亮 -> 先减增益, 增益到最小了再减曝光
+ *            任何一个通道快饱和(过曝发白/发黄) -> 直接往下调, 不等亮度比较
+ *          每调用一次走一小步(约 200ms 调一次), 所以不会来回闪.
+ *          顺便把软件白平衡也走一步.
+ *
+ * @return  none
+ */
+static void CAM_AutoExposure(void)
+{
+    u8 r, g, b, y, peak;
+#if (CAM_AWB == 1)
+    static u8 awb_div = 0;                              /* 白平衡每 2 步走一次 */
+#endif
+
+    CAM_MeasureStats(&r, &g, &b, &y);
+
+    /* 先低通滤波: 单行抽样本身有噪声, 不滤的话回路会跟着噪声来回动
+     * (现象就是画面"一会儿白一会儿暗"的呼吸感) */
+    if(ae_inited == 0)
+    {
+        ae_luma_f = y;
+        ae_rf = r;  ae_gf = g;  ae_bf = b;
+        ae_inited = 1;
+    }
+    else
+    {
+        ae_luma_f = (u8)(ae_luma_f + ((s16)((s16)y - (s16)ae_luma_f) >> AE_AVG_SHIFT));
+        ae_rf     = (u8)(ae_rf     + ((s16)((s16)r - (s16)ae_rf)     >> AE_AVG_SHIFT));
+        ae_gf     = (u8)(ae_gf     + ((s16)((s16)g - (s16)ae_gf)     >> AE_AVG_SHIFT));
+        ae_bf     = (u8)(ae_bf     + ((s16)((s16)b - (s16)ae_bf)     >> AE_AVG_SHIFT));
+    }
+
+    ae_luma = y;            /* 诊断页显示"原始"值, 更直观 */
+    ae_r = r;  ae_g = g;  ae_b = b;
+
+#if (CAM_AWB == 1)
+    if(++awb_div >= 2)
+    {
+        awb_div = 0;
+        CAM_AutoWhiteBalance(ae_rf, ae_gf, ae_bf);
+    }
+#endif
+
+    peak = (r > g) ? r : g;
+    if(b > peak) peak = b;
+
+    if((ae_luma_f < (u8)(OV2640_AE_TARGET - AE_BAND)) && (peak < 235))   /* 太暗, 而且没过曝 */
+    {
+        if(ae_exp < 255)
+        {
+            ae_exp = (u8)((ae_exp > (255 - AE_STEP_EXP)) ? 255 : (ae_exp + AE_STEP_EXP));
+        }
+        else if(ae_gain < 255)
+        {
+            ae_gain = (u8)((ae_gain > (255 - AE_STEP_GAIN)) ? 255 : (ae_gain + AE_STEP_GAIN));
+        }
+        else
+        {
+            return;                                     /* 已经到顶了, 再暗也没办法 */
+        }
+    }
+    else if((ae_luma_f > (u8)(OV2640_AE_TARGET + AE_BAND)) || (peak >= 245))  /* 太亮/快饱和 */
+    {
+        if(ae_gain > 8)
+        {
+            ae_gain = (u8)((ae_gain < (8 + AE_STEP_GAIN)) ? 8 : (ae_gain - AE_STEP_GAIN));
+        }
+        else if(ae_exp > 2)
+        {
+            ae_exp = (u8)((ae_exp < (2 + AE_STEP_EXP)) ? 2 : (ae_exp - AE_STEP_EXP));
+        }
+        else
+        {
+            return;
+        }
+    }
+    else
+    {
+        return;                                         /* 在死区里, 一点都不动 */
+    }
+
+    OV2640_SetExpGain(ae_exp, ae_gain);                 /* 写进摄像头 */
+}
+#endif
+
+/*********************************************************************
+ * @fn      CAM_PutPixel
+ *
+ * @brief   把一个摄像头像素写进片缓冲(片缓冲是"高字节在前", 屏要的顺序).
+ *          开启软件白平衡(CAM_AWB)时顺便把 R 和 B 按系数缩放一下.
+ *
+ * @param   d - 目标(片缓冲里的 2 字节)
+ *          s - 源(摄像头行缓冲里的 2 字节, 低字节在前)
+ *
+ * @return  none
+ */
+static inline void CAM_PutPixel(u8 *d, const u8 *s)
+{
+#if (CAM_AWB == 1)
+    u16 px = (u16)(((u16)s[1] << 8) | s[0]);
+    u16 out = (u16)(((u16)wb_rlut[(px >> 11) & 0x1F] << 11) |
+                    (px & 0x07E0) |
+                     (u16)wb_blut[px & 0x1F]);
+
+    d[0] = (u8)(out >> 8);
+    d[1] = (u8)(out & 0xFF);
+#elif (CAM_BYTE_SWAP == 1)
+    d[0] = s[1];
+    d[1] = s[0];
+#else
+    d[0] = s[0];
+    d[1] = s[1];
+#endif
+}
 
 /*********************************************************************
  * @fn      CAM_StoreRow
@@ -260,6 +579,7 @@ void DVP_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
  *            1) 换像素字节序(OV2640 低字节先发 -> 屏要高字节先发)
  *            2) 可选左右镜像(CAM_MIRROR_X)
  *            3) 可选整幅缩到屏上(CAM_FULL_VIEW: 横向 240->128 最近邻)
+ *            4) 可选软件白平衡(CAM_AWB)
  *          这些都在这一个循环里做完, 不会多花时间.
  *
  * @param   dst - 片缓冲里这一行的起点
@@ -283,31 +603,14 @@ static void CAM_StoreRow(u8 *dst, const u8 *src)
     acc = ((u32)CAM_ROW_SRC_W << 8);        /* 从最右边往回取 */
     for(n = 0; n < LCD_WIDTH; n++)
     {
-        const u8 *s;
-
         acc -= step;
-        s = src + ((acc >> 8) << 1);
-#if (CAM_BYTE_SWAP == 1)
-        dst[2 * n]     = s[1];
-        dst[2 * n + 1] = s[0];
-#else
-        dst[2 * n]     = s[0];
-        dst[2 * n + 1] = s[1];
-#endif
+        CAM_PutPixel(&dst[2 * n], src + ((acc >> 8) << 1));
     }
 #else
     acc = 0;
     for(n = 0; n < LCD_WIDTH; n++)
     {
-        const u8 *s = src + ((acc >> 8) << 1);
-
-#if (CAM_BYTE_SWAP == 1)
-        dst[2 * n]     = s[1];
-        dst[2 * n + 1] = s[0];
-#else
-        dst[2 * n]     = s[0];
-        dst[2 * n + 1] = s[1];
-#endif
+        CAM_PutPixel(&dst[2 * n], src + ((acc >> 8) << 1));
         acc += step;
     }
 #endif
@@ -448,10 +751,12 @@ static void LCD_DiagShow(void)
     u8   i;
     u16  k, y;
     u32  se, so;
+    u32  fps, rps;
     static u32 last_frame = 0, last_href = 0;
-    u32 fps, rps;
 
-    /* 每 500ms 刷新一次 -> 差值乘 2 就是每秒的值(直接反映帧率/行速率) */
+    /* 诊断页每 500ms 刷新一次 -> 差值乘 2 就是每秒的值
+     * (这里是准的: 调用它的循环就是 Delay_Ms(500); 实时画面的左下角叠字用的是
+     *  另一套"按行数结算"的算法, 见 SHOW_FPS 那一段) */
     fps = (frame_cnt - last_frame) * 2;
     rps = (href_cnt - last_href) * 2;
     last_frame = frame_cnt;
@@ -459,6 +764,14 @@ static void LCD_DiagShow(void)
 
     /* 行距按屏高分: 竖屏 160 -> 14, 横屏 128 -> 13; 共 10 行(最后一行只画一行高) */
     y = (u16)((LCD_HEIGHT - 12) / (DIAG_LINES - 1));
+
+    /* 顺便量一下三通道平均值(诊断用): 偏色时这三个数一眼能看出来 */
+    {
+        u8 rr, gg, bb, yy0;
+
+        CAM_MeasureStats(&rr, &gg, &bb, &yy0);
+        ae_r = rr;  ae_g = gg;  ae_b = bb;  ae_luma = yy0;
+    }
 
     LCD_Clear(BLACK);
     LCD_ShowString(0, 0, "-- DVP DIAG --", CYAN, BLACK);
@@ -470,8 +783,18 @@ static void LCD_DiagShow(void)
             (frame_cnt != 0) ? (int)(href_cnt / frame_cnt) : 0);
     LCD_ShowString(0, (u16)(y * 2), s, WHITE, BLACK);       /* 累计帧数 / 每帧行数(必须 320) */
 
-    sprintf(s, "drop:%d clk%02X", (int)row_drop_cnt, (int)OV2640_CLKRC);
-    LCD_ShowString(0, (u16)(y * 3), s, WHITE, BLACK);       /* 丢行数 / 摄像头时钟档位 */
+    /* 丢行 / 时钟档位 / 曝光 / 增益(自动曝光时 = 回路当前用的值, A = 增益自动) */
+#if (OV2640_AUTO_EXP == 1)
+    sprintf(s, "drop:%d clk%02X %d/%02X", (int)row_drop_cnt, (int)OV2640_CLKRC,
+            (int)ae_exp, (int)ae_gain);
+#elif (OV2640_GAIN_VALUE == 0)
+    sprintf(s, "drop:%d clk%02X %d/A", (int)row_drop_cnt, (int)OV2640_CLKRC,
+            (int)OV2640_AEC_LINES);
+#else
+    sprintf(s, "drop:%d clk%02X %d/%02X", (int)row_drop_cnt, (int)OV2640_CLKRC,
+            (int)OV2640_AEC_LINES, (int)OV2640_GAIN_VALUE);
+#endif
+    LCD_ShowString(0, (u16)(y * 3), s, WHITE, BLACK);
 
     sprintf(s, "flex:%d foc:%d", (int)fifo_ov_cnt,
             (int)((focus_rows != 0) ? (focus_sum / focus_rows) : 0));
@@ -489,7 +812,12 @@ static void LCD_DiagShow(void)
     }
     se /= (CAM_ROW_BYTES / 2);
     so /= (CAM_ROW_BYTES / 2);
-    sprintf(s, "e:%d o:%d", (int)se, (int)so);
+    /* lum = 自动曝光量到的亮度(滤波前)   wb = 正在施加的白平衡系数(256 = 1.0 倍, 不修色) */
+#if (CAM_AWB == 1)
+    sprintf(s, "lum:%d wb:%d/%d", (int)ae_luma, (int)wb_r, (int)wb_b);
+#else
+    sprintf(s, "lum:%d e:%d", (int)ae_luma, (int)se);
+#endif
     LCD_ShowString(0, (u16)(y * 5), s, MAGENTA, BLACK);
 
     /* 行缓冲前 6 字节: 应随镜头画面变化 */
@@ -499,14 +827,17 @@ static void LCD_DiagShow(void)
     }
     LCD_ShowString(0, (u16)(y * 6), s, GREEN, BLACK);
 
-    for(i = 0; i < 6; i++)
-    {
-        sprintf(s + i * 3, "%02X ", dvp_row_buf1[i]);
-    }
-    LCD_ShowString(0, (u16)(y * 7), s, GREEN, BLACK);
+    /* 三通道平均值: 判断偏色(发黄 = R/G 比 B 大很多; 发蓝 = B 大) */
+    sprintf(s, "rgb:%d/%d/%d", (int)ae_r, (int)ae_g, (int)ae_b);
+    LCD_ShowString(0, (u16)(y * 7), s, CYAN, BLACK);
 
-    sprintf(s, "%dx%d of %dx%d", LCD_WIDTH, LCD_HEIGHT, CAM_WIDTH, CAM_HEIGHT);
-    LCD_ShowString(0, (u16)(y * 8), s, WHITE, BLACK);       /* 屏尺寸 / 摄像头输出尺寸 */
+    /* 取景框: 尺寸 @ 左上角坐标(在摄像头 240x320 输出画面里的位置) */
+#if (CAM_FULL_VIEW == 1)
+    sprintf(s, "view full %dx%d", CAM_WIDTH, CAM_HEIGHT);
+#else
+    sprintf(s, "view %dx%d @%d,%d", CAM_VIEW_W, CAM_VIEW_H, CROP_X, CROP_Y);
+#endif
+    LCD_ShowString(0, (u16)(y * 8), s, WHITE, BLACK);
 
     /* 画面开关状态: 拍照发人看时, 一眼就知道当前是哪套设置 */
     sprintf(s, "rot%d mh%d mv%d iv%d bgr%d",
@@ -641,7 +972,6 @@ void DVP_IRQHandler(void)
                         CAM_StoreRow(&slice_buf[s][(u32)r * ROW_BYTES], fb);
 
                         slice_rows[s]++;
-                        frame_rows++;
 
                         if((r == (SLICE_ROWS - 1)) || (y == (u16)(LCD_HEIGHT - 1)))
                         {
@@ -668,7 +998,6 @@ void DVP_IRQHandler(void)
     {
         DVP->IFR &= ~RB_DVP_IF_FRM_DONE;
         row_cnt = 0;                                /* 新的一帧, 从第 0 行重新开始 */
-        frame_rows = 0;
 
         /* 一帧结束: 还没攒满的片也交出去(帧尾兜底).
          * 不加这段的话, 万一某帧漏了几行, 那一片就永远等不到"最后一行",
@@ -757,22 +1086,25 @@ int main(void)
     }
     DBG("Camera Suc\r\n");
 
-    /* 摄像头: 三种配置(见文件顶部 OV2640_READOUT_OPT 的说明) */
-#if (OV2640_READOUT_OPT == 0)
-    RGB565_Mode_Init();                         /* WCH 原配置: 240x320 输出 + 中心裁剪 */
-#elif (OV2640_READOUT_OPT == 1)
-    OV2640_RGB565_Mode();
-    OV2640_Config(OV2640_READOUT_W, OV2640_READOUT_H, CAM_WIDTH, CAM_HEIGHT, 1);
+    /* 摄像头: 只用 WCH 原例程验证过的配置(输出 240x320, 屏上取中间一块) */
+    RGB565_Mode_Init();
+
+#if (OV2640_SVGA_MODE == 1)
+    /* 换成 SVGA 栅格: 帧率约 4 倍(30fps@24MHz / 60fps@48MHz), 但一帧时间变短 -> 暗处更暗 */
+    OV2640_SetRaster(1);
 #else
-    OV2640_RGB565_Mode();
-    RGB565_Mode_Init();                         /* 先按原样配好... */
-    OV2640_Config(OV2640_READOUT_W, OV2640_READOUT_H, 0, 0, 0);   /* 再只改读出窗口 */
+    OV2640_SetRaster(0);
 #endif
+
     OV2640_Speed_Set(OV2640_PCLK_DIV, OV2640_CLKRC);   /* 输出 PCLK + 帧率时钟 */
 
 #if (OV2640_LOW_LATENCY == 1)
-    /* 固定曝光 + 增益: 把帧时间(也就是延迟)压下来, 亮度用曝光/增益补 */
-    OV2640_LowLatency((UINT8)OV2640_AEC_OUT, OV2640_GAIN_VALUE);
+    /* 初始曝光 + 增益: 之后由软件自动曝光(见 OV2640_AUTO_EXP)自己微调 */
+    OV2640_LowLatency((UINT8)OV2640_AEC_LINES, OV2640_GAIN_VALUE);
+#endif
+
+#if (CAM_AWB == 1)
+    CAM_WbBuildLut();       /* 白平衡系数表先按 1.0 倍初始化 */
 #endif
 
     Delay_Ms(500);
@@ -786,10 +1118,28 @@ int main(void)
     DBG("DVP streaming...\r\n");
     Delay_Ms(1200);                                     /* 等第一帧, 否则全是 0 */
 
+#if (SHOW_FPS == 1)
+    /* 标定"每毫秒收多少行"(摄像头的行速率由晶振决定, 用它当计时基准最准,
+     * 这样算出来的 fps 不受主循环里做了多少事的影响) */
+    {
+        u32 r0 = href_cnt;
+
+        Delay_Ms(500);
+        fps_row_per_ms = (href_cnt - r0) / 500;
+        if(fps_row_per_ms == 0)
+        {
+            fps_row_per_ms = 1;                         /* 没数据时别除零 */
+        }
+    }
+#endif
+
     {
         u32 t;
         for(t = 0; t < (DIAG_SHOW_MS / 500); t++)
         {
+#if (OV2640_AUTO_EXP == 1)
+            CAM_AutoExposure();                         /* 诊断页上就能看到自动曝光在动 */
+#endif
             LCD_DiagShow();
             Delay_Ms(500);
         }
@@ -802,10 +1152,41 @@ int main(void)
 
     {
         u16 tick = 0;
+#if (OV2640_AUTO_EXP == 1)
+        u16 ae_tick = 0;
+#endif
+#if (SHOW_FPS == 1)
+        u32 fps_base_href  = href_cnt;      /* 上一次结算时的行数 */
+        u32 fps_base_frame = frame_cnt;     /* 上一次结算时的帧数 */
+        u32 fps_win_rows   = (u32)fps_row_per_ms * FPS_WIN_MS;   /* 一个窗口对应多少行 */
+        char s1[28];
+#endif
 
         while(1)
         {
             u16 s;
+
+#if (SHOW_FPS == 1)
+            /* 用"行数"当计时基准结算帧率: 每积累一个窗口(默认 1000ms 对应的行数)
+             * 才算一次差. 之前那种"每次循环都算、还乘 2"是错的 —— 循环一次只有
+             * 约 1ms, 帧数差基本是 0, 所以永远显示 0 或 2. */
+            if((href_cnt - fps_base_href) >= fps_win_rows)
+            {
+                fps_base_href += fps_win_rows;
+                fps_val = (frame_cnt - fps_base_frame) * 1000u / FPS_WIN_MS;
+                fps_base_frame = frame_cnt;
+                fps_rps = fps_row_per_ms * 1000u;
+            }
+#endif
+
+            /* 每约 200ms 走一步软件自动曝光(测亮度 -> 调曝光/增益) */
+#if (OV2640_AUTO_EXP == 1)
+            if(++ae_tick >= 200)
+            {
+                ae_tick = 0;
+                CAM_AutoExposure();
+            }
+#endif
 
             /* 上一片搬完了就把它标回"空闲", 中断才敢往里写 */
             if((slice_inflight != 0xFF) && (LCD_PushBusy() == 0))
@@ -832,6 +1213,33 @@ int main(void)
 
                     slice_ready[s] = 0;
                     slice_rows[s]  = 0;     /* 这一片交出去了, 行数清零重新攒 */
+
+#if (SHOW_FPS == 1)
+                    /* 左下角帧率叠字: 直接画进这一片缓冲(马上要被 DMA 搬走),
+                     * 所以它会跟着画面一起上屏, 不会被下一次刷新冲掉.
+                     * 文字是 12 行高, 可能横跨两片 -> 两片各自画自己那部分
+                     * (LCD_BufShowChar 会自动裁掉超出的行, 不会写到隔壁片去). */
+                    {
+                        s16 y0    = (s16)(LCD_HEIGHT - 12);         /* 叠字起始行(屏坐标) */
+                        s16 first = (s16)(s * SLICE_ROWS);          /* 这一片的第一行 */
+                        s16 yl    = (s16)(y0 - first);              /* 在这一片里的起始行 */
+                        u16 rows  = (u16)SLICE_ROWS_OF(s);
+
+                        if((yl > -12) && (yl < (s16)rows))
+                        {
+                            const char *p = s1;
+                            u16 x = 0;
+
+                            sprintf(s1, "fps:%d", (int)fps_val);
+                            while(*p && ((x + 6) <= LCD_WIDTH))
+                            {
+                                LCD_BufShowChar(slice_buf[s], ROW_BYTES, rows, yl, x, *p, GREEN, BLACK);
+                                x = (u16)(x + 6);
+                                p++;
+                            }
+                        }
+                    }
+#endif
 
                     LCD_PushBlock((u16)(s * SLICE_ROWS), slice_buf[s], SLICE_ROWS_OF(s));
                 }

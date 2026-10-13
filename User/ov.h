@@ -100,21 +100,14 @@ typedef volatile unsigned long  *PUINT32V;
 
 
 /* 摄像头 RGB565 输出尺寸: 240x320
- * (就是 WCH 原例程验证过的配置; 屏上取中间 128x160 纯裁剪, 不做缩放) */
-#define RGB565_ROW_NUM   320
-#define RGB565_COL_NUM   480   //Col * 2
+ * (就是 WCH 原例程验证过的配置; 屏上取中间一块纯裁剪, 不做缩放) */
 #define OV2640_RGB565_HEIGHT   320
 #define OV2640_RGB565_WIDTH	   240
-
-//JPEG PIXEL 1024 * 768
-#define OV2640_JPEG_HEIGHT	768
-#define OV2640_JPEG_WIDTH	1024
 
 
 //PC13-RESET  PC3-PWDN
 #define OV_RESET_SET   {GPIOC->BSHR = GPIO_Pin_13;}
 #define OV_RESET_CLR   {GPIOC->BCR = GPIO_Pin_13;}
-#define OV_PWDN_SET    {GPIOC->BSHR = GPIO_Pin_3;}
 #define OV_PWDN_CLR    {GPIOC->BCR = GPIO_Pin_3;}
 
 //OV2640��ID
@@ -122,7 +115,6 @@ typedef volatile unsigned long  *PUINT32V;
 #define OV2640_MID				0X7FA2
 #define OV2640_PID				0X2642
 
-#define IIC_SCL_IN  {GPIOB->CFGHR&=0XFFFFF0FF;GPIOB->CFGHR|=8<<8;}
 #define IIC_SCL_OUT {GPIOB->CFGHR&=0XFFFFF0FF;GPIOB->CFGHR|=3<<8;}
 #define IIC_SDA_IN  {GPIOB->CFGHR&=0XFFFF0FFF;GPIOB->CFGHR|=8<<12;}
 #define IIC_SDA_OUT {GPIOB->CFGHR&=0XFFFF0FFF;GPIOB->CFGHR|=3<<12;}
@@ -146,36 +138,21 @@ UINT8 SCCB_WR_Reg(UINT8 Reg_Adr,UINT8 Reg_Val);
 UINT8 SCCB_RD_Reg(UINT8 Reg_Adr);
 
 void RGB565_Mode_Init(void);
-void JPEG_Mode_Init(void);
 UINT8 OV2640_Init(void);
-void OV2640_JPEG_Mode(void);
 void OV2640_RGB565_Mode(void);
 UINT8 OV2640_OutSize_Set(UINT16 Image_width,UINT16 Image_height);
 void OV2640_Speed_Set(UINT8 Pclk_Div, UINT8 Xclk_Div);
 
-/* 输出尺寸设置(完整版): 除 zoom 窗口(0x5A/0x5B/0x5C) 外,
- * 还要设 CTRLI(0x50) 的整数降采样档位 V_Div/H_Div (0=1x,1=2x,2=4x,3=8x).
- * 约束: 降采样后的处理尺寸必须 >= 输出尺寸, 否则会被截短 */
-UINT8 OV2640_OutSize_Set2(UINT16 Image_width, UINT16 Image_height,
-                          UINT8 V_Div, UINT8 H_Div);
+/* 手动设置曝光 + 增益(软件自动曝光回路用): 两个自动都关掉, 亮度由调用者决定 */
+void OV2640_SetExpGain(UINT8 Aec_Val, UINT8 Gain_Val);
 
-/* 设置传感器内部"读出窗口"(居中); UpdateDsp=1 时同时把 DSP 输入尺寸也改成这块窗口,
- * UpdateDsp=0 时只改窗口(DSP/输出尺寸保持原样, 用于单独验证窗口是否生效).
- *   WinW - 窗口宽(必须是 16 的倍数, 建议 >= 输出宽)
- *   WinH - 窗口高(必须是 8 的倍数,  建议 >= 输出高) */
-UINT8 OV2640_SetReadout(UINT16 WinW, UINT16 WinH, UINT8 UpdateDsp);
+/* 切栅格模式: 0 = UXGA(慢, ~16fps@48MHz)   1 = SVGA(快约 4 倍, ~30fps@24MHz) */
+void OV2640_SetRaster(UINT8 Svga);
 
-/* 读出窗口 + (可选)DSP 输入尺寸 + 输出尺寸(自动挑整数降采样档位) */
-UINT8 OV2640_Config(UINT16 WinW, UINT16 WinH, UINT16 OutW, UINT16 OutH, UINT8 UpdateDsp);
-
-/* 低延迟模式: 固定曝光(关自动曝光) + 增益(手动或自动上限拉满)
- * 画面延迟约等于一帧时间, 而暗处自动曝光会把帧时间拉长, 所以固定短曝光
- * 能降低延迟, 亮度用增益补(代价是暗处噪点变多).
- *   Aec_Val  - 曝光值, 越小延迟越低但画面越暗 (建议 1~32)
- *   Gain_Val - 手动增益 0x01~0xFF, 越大越亮越噪; 填 0 = 增益保持自动 */
+/* 低延迟模式: 固定曝光(关自动曝光) + 增益(手动 或 自动上限 128x)
+ *   Aec_Val  - 曝光值, 越大越亮 (写 AEC 0x10, 0~255)
+ *   Gain_Val - 手动增益 0x01~0xFF; 填 0 = 增益保持自动 */
 void OV2640_LowLatency(UINT8 Aec_Val, UINT8 Gain_Val);
-
-
 
 #endif
 

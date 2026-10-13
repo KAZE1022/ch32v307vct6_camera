@@ -11,6 +11,11 @@
 *******************************************************************************/
 #include "ov.h"
 
+/* 下面两张寄存器表沿用 WCH 的写法(扁平初始化列表), 一行一个寄存器对.
+ * 打开 -Wall 时 GCC 会提示 missing braces, 但数据本身是对的, 这里显式关掉这个提示. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-braces"
+
 /* Start Camera list of initialization configuration registers */
 const UINT8 OV2640_InitRegTbl[][2]=
 {
@@ -69,24 +74,14 @@ const UINT8 OV2640_InitRegTbl[][2]=
 	0xe5, 0x1f,	0xe1, 0x67,	0xe0, 0x00,	0xdd, 0x7f,	0x05, 0x00,
 };
 
-/* YUV422 */
-const UINT8 OV2640_YUV422RegTbl[][2]=
-{
-	0xFF, 0x00,	0xDA, 0x10,	0xD7, 0x03,	0xDF, 0x00,	0x33, 0x80,	0x3C, 0x40,	0xe1, 0x77,	0x00, 0x00,
-};
-
-/* JPEG */
-const UINT8 OV2640_JPEGRegTbl[][2]=
-{
-	0xff, 0x01,	0xe0, 0x14,	0xe1, 0x77,	0xe5, 0x1f,	0xd7, 0x03,	0xda, 0x10,	0xe0, 0x00,
-};
-
 /* RGB565 */
 const UINT8 OV2640_RGB565RegTbl[][2]=
 {
 	0xFF, 0x00,	0xDA, 0x09,	0xD7, 0x03,	0xDF, 0x02,	0x33, 0xa0,	0x3C, 0x00,	0xe1, 0x67,
 	0xff, 0x01,	0xe0, 0x00,	0xe1, 0x00,	0xe5, 0x00,	0xd7, 0x00,	0xda, 0x00,	0xe0, 0x00,
 };
+
+#pragma GCC diagnostic pop
 
 /*********************************************************************
  * @fn      SCCB_GPIO_Init
@@ -389,44 +384,7 @@ void RGB565_Mode_Init(void)
 {
 	OV2640_RGB565_Mode();
 	OV2640_OutSize_Set(OV2640_RGB565_WIDTH,OV2640_RGB565_HEIGHT);
-	OV2640_Speed_Set(28,1);
-}
-
-/*********************************************************************
- * @fn      JPEG_Mode_Init
- *
- * @brief   Init JPEG mode
- *
- * @return  none
- */
-void JPEG_Mode_Init(void)
-{
-	OV2640_JPEG_Mode();
-  	OV2640_OutSize_Set(OV2640_JPEG_WIDTH,OV2640_JPEG_HEIGHT);
-  	OV2640_Speed_Set(30,1);
-}
-
-/*********************************************************************
- * @fn      OV2640_JPEG_Mode
- *
- * @brief   JPEG Mode
- *
- * @return  none
- */
-void OV2640_JPEG_Mode(void)
-{
-	UINT16 i=0;
-
-	//YUV422
-	for(i=0;i<(sizeof(OV2640_YUV422RegTbl)/2);i++)
-	{
-		SCCB_WR_Reg(OV2640_YUV422RegTbl[i][0],OV2640_YUV422RegTbl[i][1]);
-	}
-	//JPEG
-	for(i=0;i<(sizeof(OV2640_JPEGRegTbl)/2);i++)
-	{
-		SCCB_WR_Reg(OV2640_JPEGRegTbl[i][0],OV2640_JPEGRegTbl[i][1]);
-	}
+	OV2640_Speed_Set(28,1);         /* main.c 里会用 OV2640_CLKRC 再覆盖一次 */
 }
 
 /*********************************************************************
@@ -484,201 +442,125 @@ UINT8 OV2640_OutSize_Set(UINT16 Image_width,UINT16 Image_height)
  * @fn      OV2640_LowLatency
  *
  * @brief   低延迟模式: 固定曝光 + 手动或自动增益
- *          画面延迟 ≈ 一帧时间 ≈ 曝光时间. 暗处自动曝光(AEC)会把帧时间
- *          拉长, 于是"晃动时明显拖尾/延迟". 这里关掉 AEC 用固定短曝光,
- *          亮度用增益补, 延迟就能压下来.
+ *          画面延迟 ≈ 一帧时间, 而暗处自动曝光(AEC)会把帧时间拉长,
+ *          于是"晃动时明显拖尾/延迟". 这里把曝光固定成短的, 亮度交给增益.
  *
  *          寄存器: 传感器组(0xFF=0x01)
- *            COM8(0x13) bit0=自动曝光, bit2=自动增益
- *            AEC (0x10)       = 曝光值(越小延迟越低、越暗)
+ *            COM8(0x13) bit0 = 自动曝光使能(1=自动), bit2 = 自动增益使能(1=自动),
+ *                       bit5 = 防闪烁(banding)滤波, bit[7:6] 按参考配置固定为 1
+ *            AEC (0x10)       = 曝光值(越大越亮; 8 位寄存器, 最大 255)
  *            GAIN(0x00)       = 手动增益(越大越亮越噪)
- *            COM9(0x14)       = 自动增益上限
+ *            COM9(0x14)       = 自动增益的**上限档位**, 在 bit[7:5]:
+ *                               000=2x 001=4x 010=8x 011=16x 100=32x 101=64x 110=128x
+ *                               bit3 按参考配置(0x48)固定置 1
  *
- * @param   Aec_Val  - 曝光值, 建议 1~32
- *          Gain_Val - 手动增益 0x01~0xFF; 填 0 表示增益保持自动(上限拉满)
+ * @param   Aec_Val  - 固定曝光值(写入 0x10, 最大 255)
+ *          Gain_Val - 手动增益 0x01~0xFF; 填 0 = 增益保持自动(上限 128x)
  *
  * @return  none
  */
 void OV2640_LowLatency(UINT8 Aec_Val, UINT8 Gain_Val)
 {
-	SCCB_WR_Reg(0xFF, 0x01);            /* 传感器寄存器组 */
-
 	if(Gain_Val != 0)
 	{
-		/* 曝光和增益都手动: 亮度完全由 Aec_Val / Gain_Val 决定 */
-		SCCB_WR_Reg(0x13, 0xE0);        /* COM8: 关自动曝光, 保留防闪 */
-		SCCB_WR_Reg(0x00, Gain_Val);    /* GAIN */
+		/* 曝光和增益都手动: 亮度完全由 Aec_Val / Gain_Val 决定, 噪点稳定 */
+		OV2640_SetExpGain(Aec_Val, Gain_Val);
 	}
 	else
 	{
-		/* 只固定曝光, 增益仍自动(上限拉到 128x) */
-		SCCB_WR_Reg(0x13, 0xE4);
-		SCCB_WR_Reg(0x14, 0xC8);
-	}
-
-	SCCB_WR_Reg(0x10, Aec_Val);         /* AEC: 固定曝光值 */
-	SCCB_WR_Reg(0xFF, 0x00);
-}
-
-/*********************************************************************
- * @fn      OV2640_OutSize_Set2
- *
- * @brief   更完整的输出尺寸设置(参考 Linux 内核 ov2640 驱动)
- *          Linux 驱动改尺寸的顺序是: CTRLI(含水平/垂直降采样) ->
- *          ZMOW/ZMOH/ZMHH(输出窗口) -> R_DVP_SP -> RESET,
- *          而 WCH 的精简版只写了 ZMOW/ZMOH/ZMHH.
- *          CTRLI 的 V_DIV/H_DIV 是"整数降采样"档位(0=1x,1=2x,2=4x,3=8x),
- *          ISP 的精细缩放器倍率有限, 大倍数缩小必须靠它, 否则画面会
- *          变成"放大 + 发虚"(只显示中间一小块, 还糊).
- *          参考 Linux 的取值: 640x480->0, 320x240->2, 176x144->3
- *
- * @param   Image_width  - 输出宽(4 的倍数)
- *          Image_height - 输出高(4 的倍数)
- *          V_Div        - 垂直降采样档位 0~3
- *          H_Div        - 水平降采样档位 0~3
- *
- * @return  0 - 成功
- */
-UINT8 OV2640_OutSize_Set2(UINT16 Image_width, UINT16 Image_height,
-                          UINT8 V_Div, UINT8 H_Div)
-{
-	UINT16 w, h;
-	UINT8  t;
-
-	if((Image_width % 4) || (Image_height % 4))
-	{
-		return 0x01;
-	}
-
-	w = Image_width / 4;
-	h = Image_height / 4;
-
-	SCCB_WR_Reg(0xFF, 0x00);                                    /* DSP 组 */
-	SCCB_WR_Reg(0xE0, 0x04);                                    /* RESET_DVP */
-	SCCB_WR_Reg(0x50, (UINT8)(0x80 | ((V_Div & 0x03) << 3) | (H_Div & 0x03)));  /* CTRLI */
-	SCCB_WR_Reg(0x5A, (UINT8)(w & 0xFF));
-	SCCB_WR_Reg(0x5B, (UINT8)(h & 0xFF));
-	t  = (UINT8)(((w >> 8) & 0x03) | ((h >> 6) & 0x04));
-	SCCB_WR_Reg(0x5C, t);
-	SCCB_WR_Reg(0xE0, 0x00);
-
-	return 0;
-}
-
-/*********************************************************************
- * @fn      OV2640_SetReadout
- *
- * @brief   设置传感器内部读出窗口(居中) + 对应的 DSP 输入尺寸.
- *          传感器默认读的是很大一块区域(读的行数多 -> 帧率被卡住),
- *          只读"真正要显示的那一块"就能把帧率按比例提上去.
- *          视野就等于这块窗口(越小 = 数码变焦越大).
- *
- *          寄存器参考 Linux 内核 ov2640 驱动的 size_change_preamble:
- *            传感器组: HSTART(0x17)/HEND(0x18) 单位 8 像素
- *                      VSTART(0x19)/VEND(0x1A) 单位 4 行
- *            DSP 组  : SIZEL/HSIZE8/VSIZE8/CTRL2/HSIZE/VSIZE/VHYX/TEST
- *
- * @param   WinW - 窗口宽(必须是 16 的倍数; 1600 表示全宽)
- *          WinH - 窗口高(必须是 8 的倍数;  1200 表示全高)
- *
- * @return  0 - 成功, 1 - 参数不合法
- */
-UINT8 OV2640_SetReadout(UINT16 WinW, UINT16 WinH, UINT8 UpdateDsp)
-{
-	UINT16 hstart, vstart;
-
-	if((WinW % 16) || (WinH % 8) || (WinW > 1600) || (WinH > 1200))
-	{
-		return 0x01;
-	}
-
-	/* 居中 */
-	hstart = (1600 - WinW) / 2;
-	vstart = (1200 - WinH) / 2;
-
-	/* --- 传感器读出窗口 --- */
-	SCCB_WR_Reg(0xFF, 0x01);
-	SCCB_WR_Reg(0x17, (UINT8)(hstart >> 3));                /* HSTART */
-	SCCB_WR_Reg(0x18, (UINT8)((hstart + WinW) >> 3));       /* HEND   */
-	SCCB_WR_Reg(0x19, (UINT8)(vstart >> 2));                /* VSTART */
-	SCCB_WR_Reg(0x1A, (UINT8)((vstart + WinH) >> 2));       /* VEND   */
-
-	if(UpdateDsp == 0)
-	{
+		/* 只固定曝光, 增益保持自动: 暗处自动提亮, 延迟不受影响(只是噪点变多).
+		 * 0xC8 = 110 0 1000 -> bit[7:5]=110 是 128x 上限, bit3 保持参考配置的 1 */
+		SCCB_WR_Reg(0xFF, 0x01);        /* 传感器寄存器组 */
+		SCCB_WR_Reg(0x13, 0xE4);        /* COM8: 关自动曝光 + 开自动增益 */
+		SCCB_WR_Reg(0x14, 0xC8);        /* COM9: 自动增益上限 = 128x */
+		SCCB_WR_Reg(0x10, Aec_Val);     /* AEC: 固定曝光值 */
 		SCCB_WR_Reg(0xFF, 0x00);
-		return 0;                                           /* 只改窗口, DSP 尺寸保持原样 */
 	}
+}
 
-	/* --- DSP 输入尺寸 = 这块窗口(参考 Linux 驱动的计算公式) --- */
+/*********************************************************************
+ * @fn      OV2640_SetExpGain
+ *
+ * @brief   手动设置"曝光 + 增益"(软件自动曝光回路就是用这个)
+ *          COM8 把自动曝光、自动增益都关掉, 亮度完全由这两个值决定.
+ *
+ * @param   Aec_Val  - 曝光值(写 AEC 0x10, 0~255, 越大越亮)
+ *          Gain_Val - 增益(写 GAIN 0x00, 0~255, 越大越亮越噪)
+ *
+ * @return  none
+ */
+void OV2640_SetExpGain(UINT8 Aec_Val, UINT8 Gain_Val)
+{
+	SCCB_WR_Reg(0xFF, 0x01);            /* 传感器寄存器组 */
+	SCCB_WR_Reg(0x13, 0xE0);            /* COM8: 关自动曝光 + 关自动增益 */
+	SCCB_WR_Reg(0x00, Gain_Val);        /* GAIN */
+	SCCB_WR_Reg(0x10, Aec_Val);         /* AEC  */
 	SCCB_WR_Reg(0xFF, 0x00);
-	SCCB_WR_Reg(0xE0, 0x04);                                /* RESET_DVP */
-	SCCB_WR_Reg(0x8C, (UINT8)((((WinW >> 11) & 0x01) << 6) |
-	                          (((WinW >> 3) & 0x07) << 3) |
-	                           ((WinH >> 3) & 0x07)));      /* SIZEL  */
-	SCCB_WR_Reg(0xC0, (UINT8)((WinW >> 3) & 0xFF));         /* HSIZE8 */
-	SCCB_WR_Reg(0xC1, (UINT8)((WinH >> 3) & 0xFF));         /* VSIZE8 */
-	SCCB_WR_Reg(0x86, 0x3D);                                /* CTRL2: 开 DCW/SDE/UV */
-	SCCB_WR_Reg(0x51, (UINT8)((WinW >> 2) & 0xFF));         /* HSIZE  */
-	SCCB_WR_Reg(0x52, (UINT8)((WinH >> 2) & 0xFF));         /* VSIZE  */
-	SCCB_WR_Reg(0x53, 0x00);                                /* XOFFL  */
-	SCCB_WR_Reg(0x54, 0x00);                                /* YOFFL  */
-	SCCB_WR_Reg(0x55, (UINT8)((((WinH >> 10) & 0x01) << 7) |
-	                           (((WinW >> 10) & 0x01) << 3)));  /* VHYX */
-	SCCB_WR_Reg(0x57, (UINT8)(((WinW >> 11) & 0x01) << 7)); /* TEST   */
+}
+
+/*********************************************************************
+ * @fn      OV2640_DspInputSize
+ *
+ * @brief   告诉 ISP: "我要送进来的图是 W x H"(DSP 组)
+ *          ISP 就按这个尺寸做缩放, 所以**必须和传感器真正输出的尺寸一致**,
+ *          否则画面会被拉伸/花掉. 取值公式参考 Linux 内核 ov2640 驱动.
+ *
+ * @param   W - 输入宽(8 的倍数)   H - 输入高(8 的倍数)
+ *
+ * @return  none
+ */
+static void OV2640_DspInputSize(UINT16 W, UINT16 H)
+{
+	SCCB_WR_Reg(0xFF, 0x00);                                            /* DSP 组 */
+	SCCB_WR_Reg(0xE0, 0x04);                                            /* RESET_DVP */
+	/* SIZEL = "尺寸低位补全": 高 3 位是宽/高的像素数低 3 位(不是除以 8 之后再取!)
+	 * 参考 Linux 驱动: SIZEL_HSIZE8_SET(x)=((x)&7)<<3, SIZEL_VSIZE8_SET(x)=(x)&7
+	 * 1600x1200 和 800x600 都是 8 的倍数, 所以这两位应该是 0 */
+	SCCB_WR_Reg(0x8C, (UINT8)((((W >> 11) & 0x01) << 6) |
+	                          (((W     ) & 0x07) << 3) |
+	                           ((H     ) & 0x07)));                     /* SIZEL  */
+	SCCB_WR_Reg(0xC0, (UINT8)((W >> 3) & 0xFF));                        /* HSIZE8 */
+	SCCB_WR_Reg(0xC1, (UINT8)((H >> 3) & 0xFF));                        /* VSIZE8 */
+	SCCB_WR_Reg(0x86, 0x3D);                                            /* CTRL2  */
+	SCCB_WR_Reg(0x51, (UINT8)((W >> 2) & 0xFF));                        /* HSIZE  */
+	SCCB_WR_Reg(0x52, (UINT8)((H >> 2) & 0xFF));                        /* VSIZE  */
+	SCCB_WR_Reg(0x53, 0x00);                                            /* XOFFL  */
+	SCCB_WR_Reg(0x54, 0x00);                                            /* YOFFL  */
+	SCCB_WR_Reg(0x55, (UINT8)((((H >> 10) & 0x01) << 7) |
+	                           (((W >> 10) & 0x01) << 3)));             /* VHYX   */
+	SCCB_WR_Reg(0x57, (UINT8)(((W >> 11) & 0x01) << 7));                /* TEST   */
 	SCCB_WR_Reg(0xE0, 0x00);
-
-	return 0;
 }
 
 /*********************************************************************
- * @fn      OV2640_PickDiv
+ * @fn      OV2640_SetRaster
  *
- * @brief   按"降采样后尺寸必须 >= 输出尺寸"的约束, 自动挑最大的整数降采样档位
+ * @brief   切"栅格模式" —— 帧率的总开关.
+ *          帧率 = CLK / (tLINE x 每帧行数), 而 tLINE/行数只由栅格模式(COM7)决定:
+ *            UXGA: tLINE=1922, 约 1560 行/帧     SVGA: tLINE=1190, 约 672 行/帧
+ *          所以切成 SVGA 帧率大约翻 4 倍(画面源分辨率从 1600x1200 降到 800x600).
+ *          切模式的同时要把 ISP 的"输入尺寸"也改成配套的值, 否则画面会花.
  *
- * @param   Win - 降采样前尺寸
- *          Out - 输出尺寸
+ * @param   Svga - 0 = UXGA 栅格(慢, 画面细)   1 = SVGA 栅格(快)
  *
- * @return  档位 0~3
+ * @return  none
  */
-static UINT8 OV2640_PickDiv(UINT16 Win, UINT16 Out)
+void OV2640_SetRaster(UINT8 Svga)
 {
-	UINT8 d = 0;
-
-	while((d < 3) && ((Win >> (d + 1)) >= Out))
+	SCCB_WR_Reg(0xFF, 0x01);                        /* 传感器寄存器组 */
+	if(Svga)
 	{
-		d++;
+		SCCB_WR_Reg(0x03, 0x0A);                    /* COM1: 垂直窗口 LSB = SVGA */
+		SCCB_WR_Reg(0x12, 0x40);                    /* COM7: SVGA 栅格 */
 	}
-	return d;
-}
-
-/*********************************************************************
- * @fn      OV2640_Config
- *
- * @brief   一步到位: 读出窗口 + DSP 输入尺寸 + 输出尺寸(自动挑降采样档位)
- *
- * @param   WinW/WinH - 传感器读出窗口(居中)
- *          OutW/OutH - 摄像头输出尺寸
- *
- * @return  0 - 成功
- */
-UINT8 OV2640_Config(UINT16 WinW, UINT16 WinH, UINT16 OutW, UINT16 OutH, UINT8 UpdateDsp)
-{
-	UINT8 vd, hd;
-
-	if(OV2640_SetReadout(WinW, WinH, UpdateDsp))
+	else
 	{
-		return 0x01;
+		SCCB_WR_Reg(0x03, 0x0F);                    /* COM1: 垂直窗口 LSB = UXGA */
+		SCCB_WR_Reg(0x12, 0x00);                    /* COM7: UXGA 栅格 */
 	}
 
-	if(UpdateDsp == 0)
-	{
-		return 0;               /* 只改窗口: 输出尺寸/DSP 都保持原样 */
-	}
-
-	vd = OV2640_PickDiv(WinH, OutH);
-	hd = OV2640_PickDiv(WinW, OutW);
-
-	return OV2640_OutSize_Set2(OutW, OutH, vd, hd);
+	/* ISP 的输入尺寸跟着改: UXGA=1600x1200, SVGA=800x600 */
+	OV2640_DspInputSize(Svga ? 800 : 1600, Svga ? 600 : 1200);
 }
 
 /*********************************************************************
